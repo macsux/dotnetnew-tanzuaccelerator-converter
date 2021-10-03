@@ -17,13 +17,21 @@ namespace AcceleratorConverter
     
     public class Combo : Transform
     {
-        public override string Type => "Combo";
+        public override string Type => null;
         public List<Let> Let { get; set; }
         public List<string> Include { get; set; }
         public List<string> Exclude { get; set; }
         public List<Transform> Merge { get; set; }
         public List<Transform> Chain { get; set; }
         public ConflictResolutionStrategy OnConflict { get; set; }
+    }
+    
+    public class RewritePath : Transform
+    {
+        public override string Type => "RewritePath";
+        public string Regex { get; set; }
+        public string RewriteTo { get; set; }
+        public bool? MatchOrFail { get; set; }
     }
 
     public enum ConflictResolutionStrategy

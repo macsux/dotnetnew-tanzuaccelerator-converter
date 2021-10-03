@@ -11,8 +11,10 @@ using YamlDotNet.Serialization.NamingConventions;
 
 namespace AcceleratorConverter
 {
+    
     class Program
     {
+        const string ProjectName = "DotnetAccelerator";
         static void Main(string[] args)
         {
             string codeFolder = @"C:\Projects\DotnetAccelerator\";
@@ -41,11 +43,11 @@ namespace AcceleratorConverter
 
         private static Transform MapEngine(Template? template, string codeFolder)
         {
-            var engine = new Engine()
+            var engine = new Combo()
             {
-                Merge = new List<Merge>()
+                Merge = new List<Transform>()
                 {
-                    new Merge()
+                    new Combo()
                     {
                         Include = new List<string>() {"**"},
                         Exclude = new List<string>(){".template.config/**"}
@@ -57,6 +59,31 @@ namespace AcceleratorConverter
                 .Where(x => x.Value.Type == FluffyType.Computed)
                 .Select(x => new Let() {Name = x.Key, Expression = ExpressionHelper.RewriteToSpEL(x.Value.Value)})
                 .ToList();
+
+            // rewrite path file names with application name
+            engine.Chain = MyDirectory.GetGitTrackedFiles(codeFolder)
+                .Select(x => Path.GetRelativePath(codeFolder, x).Replace(@"\","/"))
+                .Where(x => Regex.IsMatch(x, ProjectName))
+                .Select(x => new RewritePath
+                {
+                    Regex = x.Replace(@"\", "/"),
+                    RewriteTo = $"'{x.Replace(ProjectName, "' + #artifactId + '")}'"
+                })
+                .Cast<Transform>()
+                .ToList();
+            // wildcard rename any text that uses projectname to actual application name
+            engine.Chain.Add(new ReplaceText()
+            {
+                Substitutions = new List<Substitution>()
+                {
+                    new Substitution()
+                    {
+                        Text = ProjectName,
+                        With = "#artifactId"
+                    }
+                }
+            });
+            
 
             AddConditionalFiles(template, engine);
 
@@ -75,7 +102,7 @@ namespace AcceleratorConverter
             foreach (var fileGroup in templatesByFileAndCondition)
             {
                 var fileName = fileGroup.Key;
-                var fileMerge = new Merge()
+                var fileMerge = new Combo()
                 {
                     Include = new List<string>() {fileName.Replace(@"\", @"/")},
                     Chain = new()
@@ -112,7 +139,7 @@ namespace AcceleratorConverter
             return engine;
         }
 
-        private static void AddConditionalFiles(Template? template, Engine engine)
+        private static void AddConditionalFiles(Template? template, Combo engine)
         {
             // .net does optional files via exclusion. this approach doesn't work well with accelerator merge
             // we first exclude the file under default selection criteria, and optionally ADD it in if the condition is true
@@ -127,16 +154,17 @@ namespace AcceleratorConverter
                 .GroupBy(x => x.Condition)
                 .ToList();
 
-            var globalMatch = engine.Merge.First();
+            var globalMatch = (Combo)engine.Merge.First();
             foreach (var conditionalFile in conditionalExcludes)
             {
                 var condition = ExpressionHelper.RewriteToSpEL(ExpressionHelper.Invert(conditionalFile.Key));
-                var merge = new Merge
+                var merge = new Combo
                 {
                     Condition = condition,
                     Include = conditionalFile.SelectMany(x => x.Exclude.AsEnumerable()).ToList(),
                 };
                 engine.Merge.Add(merge);
+                // we add any files that are conditional to global exclusion list and then selectively add them back with condition
                 globalMatch.Exclude.AddRange(merge.Include);
             }
         }
@@ -150,7 +178,11 @@ namespace AcceleratorConverter
             var xmlPattern = new Regex($@"[ ]*<!--\s*#if (?<expression>.+?)-->.+?<!--\s*#endif\s*-->", regexOptions);
             Dictionary<string, MatchCollection> templatedFiles = new();
             var files = MyDirectory.GetFiles(codeFolder, new[]{"*.cs","*.csproj", "*.yaml", "*.json"}, SearchOption.AllDirectories)
-                .Where(x => !Path.GetFileName(x).Equals("accelerator.yaml"));
+                .Where(x =>
+                {
+                    var filename = Path.GetFileName(x);
+                    return !(filename.StartsWith("accelerator") && filename.EndsWith(".yaml"));
+                });
 
             bool ReferencesTemplateSymbols(Match match)
             {
@@ -186,18 +218,7 @@ namespace AcceleratorConverter
             accelerator.Description = template.Description;
             accelerator.Tags = template.Tags.Select(x => x.Value).ToList();
             accelerator.IconUrl = "https://iconape.com/wp-content/files/km/370669/svg/370669.svg";
-            accelerator.Options = new()
-            {
-                new Option()
-                {
-                    Name = "applicationName",
-                    Label = "Application Name",
-                    Description = "Application Name",
-                    InputType = InputType.Text.ToString().ToLower(),
-                    DefaultValue = template.SourceName,
-                    Required = true,
-                }
-            };
+            accelerator.Options = new();
             foreach (var (symbolName, symbolDefinition) in template.Symbols.Where(x => x.Value.Type == FluffyType.Parameter))
             {
 
