@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Text.RegularExpressions;
+using GlobExpressions;
 using Newtonsoft.Json;
 using TemplateEngine;
 using YamlDotNet.Serialization;
@@ -14,7 +15,7 @@ namespace AcceleratorConverter
     
     class Program
     {
-        const string ProjectName = "DotnetAccelerator";
+        // const string ProjectName = "DotnetAccelerator";
         static void Main(string[] args)
         {
             string codeFolder = @"C:\Projects\DotnetAccelerator\";
@@ -59,30 +60,72 @@ namespace AcceleratorConverter
                 .Where(x => x.Value.Type == FluffyType.Computed)
                 .Select(x => new Let() {Name = x.Key, Expression = ExpressionHelper.RewriteToSpEL(x.Value.Value)})
                 .ToList();
+            
+            var globalExcludes = template.Sources
+                .Where(x => x.Modifiers != null)
+                .SelectMany(x => x.Modifiers
+                    .Where(x => x.Condition == null && (x.Exclude?.Any() ?? false)))
+                .SelectMany(x => x.Exclude)
+                .ToList();
+
+
+            var globalSearchReplace = template.Symbols
+                .Where(x => !string.IsNullOrEmpty(x.Value.FileRename))
+                .Select(x => (x.Value.FileRename, x.Key))
+                .Union(new[] {(From: template.SourceName, To: "artifactId")})
+                .ToDictionary(x => x.Item1, x => x.Item2);
+
+            var replaceSymbols = globalSearchReplace.Keys.ToHashSet();
 
             // rewrite path file names with application name
-            engine.Chain = MyDirectory.GetGitTrackedFiles(codeFolder)
+            engine.Chain =  MyDirectory.GetGitTrackedFiles(codeFolder)
                 .Select(x => Path.GetRelativePath(codeFolder, x).Replace(@"\","/"))
-                .Where(x => Regex.IsMatch(x, ProjectName))
-                .Select(x => new RewritePath
+                .Where(x => replaceSymbols.Any(y => Regex.IsMatch(x,  y)))
+                .Where(x => !globalExcludes.Any(excludePath => Glob.IsMatch(x, excludePath)))
+                .Select(x =>
                 {
-                    Regex = x.Replace(@"\", "/"),
-                    RewriteTo = $"'{x.Replace(ProjectName, "' + #artifactId + '")}'"
+                    var filePath = x;
+                    foreach (var (search,replace) in globalSearchReplace)
+                    {
+                        filePath = $"{filePath.Replace(search, $"' + #{replace} + '")}";
+                    }
+                    return new RewritePath
+                    {
+                        Regex = x.Replace(@"\", "/"),
+                        RewriteTo = $"'{filePath}'"
+                    };
                 })
                 .Cast<Transform>()
                 .ToList();
             // wildcard rename any text that uses projectname to actual application name
-            engine.Chain.Add(new ReplaceText()
+
+            engine.Chain.AddRange(globalSearchReplace.Select(x =>
             {
-                Substitutions = new List<Substitution>()
+                var from = x.Key;
+                var to = x.Value;
+                return new ReplaceText()
                 {
-                    new Substitution()
+                    Substitutions = new List<Substitution>()
                     {
-                        Text = ProjectName,
-                        With = "#artifactId"
+                        new Substitution()
+                        {
+                            Text = from,
+                            With = $"#{to}"
+                        }
                     }
-                }
-            });
+                };
+            }));
+            // engine.Chain.Add(new ReplaceText()
+            // {
+            //     Substitutions = new List<Substitution>()
+            //     {
+            //         new Substitution()
+            //         {
+            //             Text = template.SourceName,
+            //             With = "#artifactId"
+            //         }
+            //     }
+            // });
             
 
             AddConditionalFiles(template, engine);
@@ -90,7 +133,7 @@ namespace AcceleratorConverter
             var templatedFiles = GetTemplatedFiles(template, codeFolder);
 
 
-            var templatesByFileAndCondition = templatedFiles
+            var templatesByFile = templatedFiles
                 .SelectMany(x => x.Value.Select(match => new
                 {
                     File = x.Key,
@@ -99,7 +142,7 @@ namespace AcceleratorConverter
                 }))
                 .GroupBy(x => (x.File))
                 .ToList();
-            foreach (var fileGroup in templatesByFileAndCondition)
+            foreach (var fileGroup in templatesByFile)
             {
                 var fileName = fileGroup.Key;
                 var fileMerge = new Combo()
@@ -135,6 +178,8 @@ namespace AcceleratorConverter
                     });
                 }
             }
+            
+            
 
             return engine;
         }
@@ -147,34 +192,42 @@ namespace AcceleratorConverter
             if (template.Sources == null)
                 return;
             
+            
             var conditionalExcludes = template.Sources
                 .Where(x => x.Modifiers != null)
                 .SelectMany(x => x.Modifiers
-                    .Where(x => x.Condition != null && (x.Include == null || !x.Include.Any())))
+                    .Where(x =>  (x.Include == null || !x.Include.Any())))
                 .GroupBy(x => x.Condition)
                 .ToList();
 
             var globalMatch = (Combo)engine.Merge.First();
             foreach (var conditionalFile in conditionalExcludes)
             {
-                var condition = ExpressionHelper.RewriteToSpEL(ExpressionHelper.Invert(conditionalFile.Key));
-                var merge = new Combo
+                var condition = !string.IsNullOrEmpty(conditionalFile.Key) ? ExpressionHelper.RewriteToSpEL(ExpressionHelper.Invert(conditionalFile.Key)) : null;
+                var include = conditionalFile.SelectMany(x => x.Exclude.AsEnumerable()).ToList();
+                if (condition != null)
                 {
-                    Condition = condition,
-                    Include = conditionalFile.SelectMany(x => x.Exclude.AsEnumerable()).ToList(),
-                };
-                engine.Merge.Add(merge);
+                    var merge = new Combo
+                    {
+                        Condition = condition,
+                        Include = include,
+                    };
+                    engine.Merge.Add(merge);
+                }
+
                 // we add any files that are conditional to global exclusion list and then selectively add them back with condition
-                globalMatch.Exclude.AddRange(merge.Include);
+                globalMatch.Exclude.AddRange(include);
             }
         }
+        
+        private static List<string> GetKnownSymbols(Template template) => template.Symbols.Select(x => x.Key).ToList();
 
         private static Dictionary<string, MatchCollection> GetTemplatedFiles(Template? template, string codeFolder)
         {
-            var knownSymbols = template.Symbols.Select(x => x.Key).ToList();
+            var knownSymbols = GetKnownSymbols(template);
             var regexOptions = RegexOptions.Singleline | RegexOptions.Compiled;
-            var hashCommentPattern = new Regex($"[ ]*#if (?<expression>.+?)\n.+?#endif[ ]*\n?", regexOptions);
-            var jsonPattern = new Regex($"[ ]*//#if (?<expression>.+?)\n.+?//#endif[ ]*\n?", regexOptions);
+            var hashCommentPattern = new Regex($"[ ]*#if (?<expression>.+?)\n.+?#endif[ ]*", regexOptions);
+            var jsonPattern = new Regex($"[ ]*//#if (?<expression>.+?)\n.+?//#endif[ ]*", regexOptions);
             var xmlPattern = new Regex($@"[ ]*<!--\s*#if (?<expression>.+?)-->.+?<!--\s*#endif\s*-->", regexOptions);
             Dictionary<string, MatchCollection> templatedFiles = new();
             var files = MyDirectory.GetFiles(codeFolder, new[]{"*.cs","*.csproj", "*.yaml", "*.json"}, SearchOption.AllDirectories)
@@ -219,6 +272,18 @@ namespace AcceleratorConverter
             accelerator.Tags = template.Tags.Select(x => x.Value).ToList();
             accelerator.IconUrl = "https://iconape.com/wp-content/files/km/370669/svg/370669.svg";
             accelerator.Options = new();
+
+            // var projectNameOption = new Option
+            // {
+            //     Name = "artifactId",
+            //     DataType = "string",
+            //     Label = "Name",
+            //     Required = true,
+            //     InputType = InputType.Text.ToString().ToLower(),
+            //     DefaultValue = template.SourceName
+            // };
+            // accelerator.Options.Add(projectNameOption);
+            
             foreach (var (symbolName, symbolDefinition) in template.Symbols.Where(x => x.Value.Type == FluffyType.Parameter))
             {
 
@@ -236,7 +301,7 @@ namespace AcceleratorConverter
                     {
                         Datatype.Choice => InputType.Radio,
                         Datatype.Bool => InputType.Toggle,
-                        _ => symbolDefinition.Choices.Any() ? InputType.Radio : InputType.Text
+                        _ => symbolDefinition.Choices?.Any() ?? false ? InputType.Radio : InputType.Text
                     }).ToString().ToLower(),
                     DefaultValue = symbolDefinition.DefaultValue,
                     Choices = symbolDefinition.Choices?
